@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WFH Tracker</title>
+<!--
+  WFH TRACKER — cloud-synced version
+  (Rolling Top 8 of 12 — past 12 weeks, top 8 count)
+  ============================================================
+  Hosting: GitHub Pages (static site — serves this file only).
+  Data:    Firebase Firestore (free Spark plan). GitHub Pages
+           cannot store data itself, so Firestore is the shared
+           store that all your devices read/write.
+
+  SETUP (one time, ~10 min):
+  1. Go to https://console.firebase.google.com > Add project
+     (any name, e.g. "wfh-tracker", Google Analytics off is fine).
+  2. Build > Firestore Database > Create database > Start in
+     production mode > pick a location (us-central is fine).
+  3. Build > Authentication > Get started > Sign-in method >
+     enable Google.
+  4. Project settings (gear) > Your apps > Web app </> >
+     register app, copy the firebaseConfig object.
+  5. Paste that object into FIREBASE_CONFIG below, replacing
+     the PASTE_YOUR_* placeholders.
+  6. In Firestore > Rules, paste the rules from README.md
+     (they allow only your Google account to read/write).
+  7. Push this file to GitHub, enable Pages, open the site,
+     click "Sign in with Google" once per device. Done — edits
+     on any device appear on the others in ~1 second.
+
+  Until FIREBASE_CONFIG is filled in, the app works exactly
+  like your original: data in this browser's localStorage only,
+  with a "Local only" badge.
+-->
+<style>
+  body{font-family:Arial;margin:20px}
+  .row{display:grid;grid-template-columns:100px 120px 90px 180px 220px;gap:8px;padding:4px}
+  .hdr{font-weight:bold}
+  .included{background:#4caf50;color:white}
+  .excluded{background:#ffcdd2}
+  .future{background:#e3f2fd}
+  input{width:80px}
+  .controls{margin:10px 0}
+  #syncbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+    background:#f5f5f5;border:1px solid #ddd;border-radius:8px;
+    padding:8px 12px;margin:10px 0;font-size:14px}
+  #syncDot{font-size:18px;line-height:1}
+  #syncDot.ok{color:#2e7d32} #syncDot.busy{color:#ef6c00} #syncDot.off{color:#9e9e9e}
+  #authBtn{cursor:pointer}
+  .muted{color:#666;font-size:13px}
+</style>
+</head>
+<body>
+<h2>Past 12 Completed Weeks</h2>
+
+<div id="syncbar">
+  <span id="syncDot" class="off">&#9679;</span>
+  <span id="syncText">Local only — connect Firebase to sync across devices</span>
+  <span id="userText" class="muted"></span>
+  <button id="authBtn" style="display:none">Sign in with Google</button>
+  <span id="lastSync" class="muted"></span>
+</div>
+
+<div class="controls">
+  <button onclick="exportData()">Export</button>
+  <button onclick="importData()">Import</button>
+  <button onclick="clearData()">Clear All</button>
+  <span id="count"></span>
+</div>
+<div class="row hdr"><div>Status</div><div>Week Start</div><div>Value</div><div>Drop Status</div><div>Info</div></div>
+<div id="past"></div>
+<div><b>Top 8 Total:</b> <span id="total">0</span></div>
+<hr>
+<h2>Next 24 Weeks</h2>
+<div class="row hdr"><div>Status</div><div>Week Start</div><div>Value</div><div>Drop Status</div><div>Rolling Total</div></div>
+<div id="future"></div>
+
+<script type="module">
+// ---- Firebase config: paste your web-app config here (see header comment) ----
+const FIREBASE_CONFIG = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_PROJECT.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT.appspot.com",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
+};
+const FIREBASE_CONFIGURED = !String(FIREBASE_CONFIG.apiKey || "").startsWith("PASTE_");
+
+// ---- Original logic, unchanged ----
+const KEY = 'weekValuesUnlimited';
+let store = JSON.parse(localStorage.getItem(KEY) || '{}');
+const P = 12, F = 52, all = [];
+const today = new Date();
+const base = new Date(today);
+base.setDate(base.getDate() - base.getDay() - 7);
+function fmt(d){ return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0')+'/'+d.getFullYear(); }
+
+function setSync(state, text){
+  const dot = document.getElementById('syncDot');
+  const el = document.getElementById('syncText');
+  dot.className = state; // ok | busy | off
+  if (text) el.textContent = text;
+}
+function setLastSync(){
+  document.getElementById('lastSync').textContent =
+    'Last synced ' + new Date().toLocaleTimeString();
+}
+
+function saveLocal(){
+  localStorage.setItem(KEY, JSON.stringify(store));
+  updateCount();
+}
+
+// Cloud save is wired up below (no-op until Firebase is configured + signed in).
+let saveCloud = () => {};
+let cloudReady = false;
+
+function onValueChanged(){
+  saveLocal();
+  calc();
+  saveCloud();
+}
+
+function mk(label, status, fut){
+  const r = document.createElement('div');
+  r.className = 'row' + (fut ? ' future' : '');
+  r.innerHTML = `<div class=s>${status}</div><div>${label}</div><input type=number><div class=drop></div><div class=extra></div>`;
+  const inp = r.querySelector('input');
+  inp.value = (store[label] ?? 0);
+  inp.addEventListener('input', () => {
+    store[label] = Number(inp.value) || 0;
+    onValueChanged();
+  });
+  return { row: r, input: inp, label };
+}
+for (let i = 0; i < P; i++){
+  let d = new Date(base); d.setDate(d.getDate() - ((P-1-i)*7));
+  let w = mk(fmt(d), 'COUNTED', false);
+  past.appendChild(w.row); all.push(w);
+}
+for (let i = 0; i < F; i++){
+  let d = new Date(base); d.setDate(d.getDate() + ((i+1)*7));
+  let w = mk(fmt(d), 'FUTURE', true);
+  future.appendChild(w.row); all.push(w);
+}
+const val = i => Number(all[i].input.value) || 0;
+function top8(s, e){
+  return [...Array(e-s).keys()].map(k => ({ i: s+k, v: val(s+k) }))
+    .sort((a,b) => b.v-a.v || a.i-b.i).slice(0,8).map(x => x.i);
+}
+function calc(){
+  let t = top8(0,12), set = new Set(t);
+  document.getElementById('total').textContent = t.reduce((a,i) => a+val(i), 0);
+  for (let i = 0; i < 12; i++){
+    all[i].row.className = 'row ' + (set.has(i) ? 'included' : 'excluded');
+    all[i].row.querySelector('.s').textContent = set.has(i) ? 'COUNTED' : 'DROPPED';
+  }
+  for (let f = 12; f < all.length; f++){
+    all[f].row.querySelector('.extra').textContent = top8(f-12, f).reduce((a,i) => a+val(i), 0);
+  }
+  for (let idx = 12; idx < all.length; idx++){
+    let w = 0, c = 0;
+    for (let f = 12; f < all.length; f++){
+      if (idx >= f-12 && idx < f){ w++; if (top8(f-12, f).includes(idx)) c++; }
+    }
+    all[idx].row.querySelector('.drop').textContent =
+      w === 0 ? 'Not Used' : c === 0 ? 'Always Dropped' : c === w ? 'Always Counted' : `Counted ${c}/${w}`;
+  }
+}
+function updateCount(){
+  document.getElementById('count').textContent = 'Stored weeks: ' + Object.keys(store).length;
+}
+
+// Apply a store received from the cloud: update every input except the
+// one the user is typing in right now, so a remote edit never clobbers
+// an in-progress keystroke.
+function applyStore(next){
+  store = { ...next };
+  for (const w of all){
+    if (document.activeElement !== w.input){
+      w.input.value = (store[w.label] ?? 0);
+    }
+  }
+  saveLocal();
+  calc();
+}
+
+window.exportData = function(){
+  const b = new Blob([JSON.stringify(store, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b); a.download = 'week-values.json'; a.click();
+};
+window.importData = function(){
+  const i = document.createElement('input'); i.type = 'file';
+  i.onchange = e => {
+    const f = e.target.files[0]; const r = new FileReader();
+    r.onload = () => {
+      store = JSON.parse(r.result);
+      saveLocal();
+      if (cloudReady) saveCloudNow();
+      location.reload();
+    };
+    r.readAsText(f);
+  };
+  i.click();
+};
+window.clearData = function(){
+  if (confirm('Clear all saved data?')){
+    store = {};
+    saveLocal();
+    if (cloudReady) saveCloudNow();
+    location.reload();
+  }
+};
+let saveCloudNow = () => {};
+
+updateCount();
+calc();
+
+// ---- Firebase sync (only runs when FIREBASE_CONFIG is filled in) ----
+if (FIREBASE_CONFIGURED){
+  setSync('busy', 'Connecting to cloud…');
+  const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js");
+  const { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut }
+    = await import("https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js");
+  const { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp }
+    = await import("https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js");
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+  const docRef = doc(db, 'appData', 'weekValues'); // one shared doc, all weeks in it
+  const provider = new GoogleAuthProvider();
+  const authBtn = document.getElementById('authBtn');
+  authBtn.style.display = '';
+
+  let saveTimer = null;
+  let unsubscribe = null;
+
+  saveCloud = () => {
+    if (!cloudReady) return;
+    setSync('busy', 'Saving…');
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveCloudNow(), 600); // debounce rapid typing
+  };
+  saveCloudNow = async () => {
+    if (!cloudReady) return;
+    try {
+      await setDoc(docRef, { values: store, updatedAt: serverTimestamp() }, { merge: true });
+      setSync('ok', 'Synced — same data on all devices');
+      setLastSync();
+    } catch (e){
+      console.error(e);
+      setSync('busy', 'Save failed — check connection / Firestore rules');
+    }
+  };
+
+  authBtn.addEventListener('click', async () => {
+    if (auth.currentUser){ await signOut(auth); return; }
+    try { await signInWithPopup(auth, provider); }
+    catch (e){ await signInWithRedirect(auth, provider); } // popup blocked (mobile)
+  });
+
+  onAuthStateChanged(auth, async (user) => {
+    if (!user){
+      cloudReady = false;
+      if (unsubscribe){ unsubscribe(); unsubscribe = null; }
+      authBtn.textContent = 'Sign in with Google';
+      document.getElementById('userText').textContent = '';
+      setSync('off', 'Signed out — showing this device\u2019s saved copy');
+      return;
+    }
+    authBtn.textContent = 'Sign out';
+    document.getElementById('userText').textContent = user.email || '';
+    setSync('busy', 'Loading cloud data…');
+
+    // First sign-in migration: if the cloud is empty but this device
+    // has local values, upload them once so other devices get them.
+    const snap = await getDoc(docRef);
+    if (!snap.exists() && Object.keys(store).length > 0){
+      await setDoc(docRef, { values: store, updatedAt: serverTimestamp() });
+    }
+    cloudReady = true;
+    unsubscribe = onSnapshot(docRef, (s) => {
+      if (!s.exists()) return;
+      const cloud = s.data().values || {};
+      // Only re-render if something actually changed (avoids echoing
+      // our own save back and resetting the input you're typing in).
+      if (JSON.stringify(cloud) !== JSON.stringify(store)){
+        applyStore(cloud);
+        setSync('ok', 'Synced — same data on all devices');
+        setLastSync();
+      }
+    }, (e) => {
+      console.error(e);
+      setSync('busy', 'Sync error — check Firestore rules');
+    });
+    setSync('ok', 'Synced — same data on all devices');
+  });
+} else {
+  setSync('off', 'Local only — paste your Firebase config in index.html to sync across devices');
+}
+</script>
+</body>
+</html>
