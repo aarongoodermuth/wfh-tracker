@@ -119,6 +119,10 @@ function saveLocal(){
 // Cloud save is wired up below (no-op until Firebase is configured + signed in).
 let saveCloud = () => {};
 let cloudReady = false;
+// Labels edited locally but not yet confirmed saved to Firestore.
+// A cloud snapshot must never overwrite these: it is the echo of an
+// older write, not a newer remote change.
+let dirtyLabels = new Set();
 
 function onValueChanged(){
   saveLocal();
@@ -134,6 +138,7 @@ function mk(label, status, fut){
   inp.value = (store[label] ?? 0);
   inp.addEventListener('input', () => {
     store[label] = Number(inp.value) || 0;
+    dirtyLabels.add(label);
     onValueChanged();
   });
   return { row: r, input: inp, label };
@@ -178,11 +183,17 @@ function updateCount(){
 
 // Apply a store received from the cloud: update every input except the
 // one the user is typing in right now, so a remote edit never clobbers
-// an in-progress keystroke.
+// an in-progress keystroke. The focused field's on-screen value is
+// newer than any snapshot, so keep it in store too — previously
+// applyStore replaced store with the snapshot even for the focused
+// field, so the next save wrote the old value back to the cloud and
+// the increment looked like it "reset".
 function applyStore(next){
   store = { ...next };
   for (const w of all){
-    if (document.activeElement !== w.input){
+    if (document.activeElement === w.input){
+      store[w.label] = Number(w.input.value) || 0;
+    } else {
       w.input.value = (store[w.label] ?? 0);
     }
   }
@@ -241,6 +252,10 @@ if (FIREBASE_CONFIGURED){
 
   let saveTimer = null;
   let unsubscribe = null;
+  // JSON of the last payload we sent. A snapshot matching it is just
+  // Firestore echoing our own write back, not a remote change.
+  let lastSentJSON = null;
+  let saveInFlight = false;
 
   saveCloud = () => {
     if (!cloudReady) return;
@@ -249,14 +264,28 @@ if (FIREBASE_CONFIGURED){
     saveTimer = setTimeout(() => saveCloudNow(), 600); // debounce rapid typing
   };
   saveCloudNow = async () => {
-    if (!cloudReady) return;
+    if (!cloudReady || saveInFlight) return;
+    // Snapshot the store now: store is reassigned by applyStore, and
+    // the user may edit again while this write is in flight. Writing
+    // a live reference would let a later snapshot overwrite the
+    // in-flight value.
+    const payload = { ...store };
+    const sentDirty = new Set(dirtyLabels);
+    lastSentJSON = JSON.stringify(payload);
+    saveInFlight = true;
     try {
-      await setDoc(docRef, { values: store, updatedAt: serverTimestamp() }, { merge: true });
+      await setDoc(docRef, { values: payload, updatedAt: serverTimestamp() }, { merge: true });
+      for (const label of sentDirty) dirtyLabels.delete(label);
       setSync('ok', 'Synced — same data on all devices');
       setLastSync();
     } catch (e){
       console.error(e);
       setSync('busy', 'Save failed — check connection / Firestore rules');
+    } finally {
+      saveInFlight = false;
+      // Edited while the write was in flight? Save again — the new
+      // value was not in the payload we just sent.
+      if (dirtyLabels.size > 0) saveCloud();
     }
   };
 
@@ -309,13 +338,29 @@ if (FIREBASE_CONFIGURED){
     unsubscribe = onSnapshot(docRef, (s) => {
       if (!s.exists()) return;
       const cloud = s.data().values || {};
-      // Only re-render if something actually changed (avoids echoing
-      // our own save back and resetting the input you're typing in).
-      if (JSON.stringify(cloud) !== JSON.stringify(store)){
-        applyStore(cloud);
-        setSync('ok', 'Synced — same data on all devices');
-        setLastSync();
+      const cloudJSON = JSON.stringify(cloud);
+      // Echo of our own last write — ignore, it is not a remote change.
+      if (cloudJSON === lastSentJSON) return;
+      if (cloudJSON === JSON.stringify(store)) return;
+      // Local edits not yet saved are newer than this snapshot: it is
+      // the echo of an older write (e.g. you tapped "up" twice fast —
+      // the first save's echo arrived after the second tap, and the
+      // old code overwrote store with it, so the second tap "reset").
+      // Merge instead of overwriting: keep every locally-dirty field,
+      // take the rest from the cloud, then push the merged result.
+      if (dirtyLabels.size > 0 || saveInFlight){
+        const merged = { ...cloud };
+        for (const label of dirtyLabels) merged[label] = store[label] ?? 0;
+        for (const w of all){
+          if (document.activeElement === w.input) merged[w.label] = Number(w.input.value) || 0;
+        }
+        applyStore(merged);
+        saveCloud();
+        return;
       }
+      applyStore(cloud);
+      setSync('ok', 'Synced — same data on all devices');
+      setLastSync();
     }, (e) => {
       console.error(e);
       setSync('busy', 'Sync error — check Firestore rules');
