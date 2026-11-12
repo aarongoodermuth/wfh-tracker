@@ -1,0 +1,29 @@
+name: Deploy WFH Tracker to GitHub Pages
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inject Firebase API key
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+        run: python3 -c "import pathlib, os; p=pathlib.Path('index.html'); t=p.read_text(); assert '__FIREBASE_API_KEY__' in t, 'placeholder missing'; p.write_text(t.replace('__FIREBASE_API_KEY__', os.environ['FIREBASE_API_KEY']))"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - id: deployment
+        uses: actions/deploy-pages@v4
