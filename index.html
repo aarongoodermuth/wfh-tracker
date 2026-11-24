@@ -132,6 +132,10 @@ let cloudReady = false;
 // A cloud snapshot must never overwrite these: it is the echo of an
 // older write, not a newer remote change.
 let dirtyLabels = new Set();
+// Timestamp (ms) of the newest cloud state seen so far, persisted so a
+// reload does not lose the stale-snapshot guard below.
+const AT_KEY = 'weekValuesLastCloudAt';
+let lastCloudAt = Number(localStorage.getItem(AT_KEY) || 0);
 
 function onValueChanged(){
   saveLocal();
@@ -208,6 +212,19 @@ function applyStore(next){
   }
   saveLocal();
   calc();
+}
+
+// A cloud snapshot must never silently drop a week this device knows
+// about: a week absent from the snapshot was never uploaded (or was
+// lost by a stale write), not deliberately cleared — a real clear
+// writes the week back as 0, so the key is still present. Keep such
+// weeks and let the caller push them back up. An empty snapshot is a
+// genuine Clear All, so it stays empty.
+function withRescued(cloud){
+  if (Object.keys(cloud).length === 0) return { ...cloud };
+  const merged = { ...cloud };
+  for (const k of Object.keys(store)) if (!(k in cloud)) merged[k] = store[k];
+  return merged;
 }
 
 window.exportData = function(){
@@ -346,7 +363,20 @@ if (FIREBASE_CONFIGURED){
     cloudReady = true;
     unsubscribe = onSnapshot(docRef, (s) => {
       if (!s.exists()) return;
-      const cloud = s.data().values || {};
+      const data = s.data();
+      const cloud = data.values || {};
+      // A snapshot older than the newest cloud state we have already
+      // seen is stale (e.g. the echo of an older write arriving after
+      // a newer one was acknowledged). Ignore it instead of letting
+      // applyStore overwrite the store with old values. updatedAt is
+      // null on a pending local echo, which is never stale.
+      const snapAt = data.updatedAt;
+      const snapMs = snapAt && typeof snapAt.toMillis === 'function' ? snapAt.toMillis() : null;
+      if (snapMs !== null && snapMs < lastCloudAt) return;
+      if (snapMs !== null && snapMs > lastCloudAt){
+        lastCloudAt = snapMs;
+        localStorage.setItem(AT_KEY, String(snapMs));
+      }
       const cloudJSON = JSON.stringify(cloud);
       // Echo of our own last write — ignore, it is not a remote change.
       if (cloudJSON === lastSentJSON) return;
@@ -358,7 +388,7 @@ if (FIREBASE_CONFIGURED){
       // Merge instead of overwriting: keep every locally-dirty field,
       // take the rest from the cloud, then push the merged result.
       if (dirtyLabels.size > 0 || saveInFlight){
-        const merged = { ...cloud };
+        const merged = withRescued(cloud);
         for (const label of dirtyLabels) merged[label] = store[label] ?? 0;
         for (const w of all){
           if (document.activeElement === w.input) merged[w.label] = Number(w.input.value) || 0;
@@ -367,7 +397,16 @@ if (FIREBASE_CONFIGURED){
         saveCloud();
         return;
       }
-      applyStore(cloud);
+      // Weeks this device knows about but the snapshot does not contain
+      // were never saved to the cloud (or were lost by a stale write):
+      // without this, applyStore(cloud) zeroes them on every load and
+      // saveLocal persists the loss — future weeks entered and then
+      // refreshed before the debounced save finished never came back.
+      // Keep them and push them back up.
+      const rescued = withRescued(cloud);
+      const rescuedAny = Object.keys(rescued).length > Object.keys(cloud).length;
+      applyStore(rescued);
+      if (rescuedAny) saveCloud();
       setSync('ok', 'Synced — same data on all devices');
       setLastSync();
     }, (e) => {
